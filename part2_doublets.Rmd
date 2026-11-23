@@ -1,0 +1,260 @@
+---
+title: "Novogene Analysis"
+subtitle: "Doublets"
+date: " Last updated on `r format(Sys.time(), '%B %d, %Y')`"
+author: "Wes Horton"
+output:
+  html_document:
+    toc: true
+    toc_float: 
+      collapsed: false
+      smooth_scroll: false
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r}
+plotDoubletUmap <- function(obj, qcDir_v, runName_v = NULL, sid_v, print_v = T) {
+  #' Plot Doublet UMAP
+  #' @description compute a quick UMAP on singlets + doublets and save one
+  #' PNG per sample colored by scDblFinder class (the doublets must still
+  #' be in the object, since they are the point of the plot). Normalization
+  #' happens on a local copy: the caller's object keeps raw counts only.
+  #' @param obj seurat object with scDblFinder.class in metadata
+  #' @param qcDir_v directory to output the doublet_umaps subfolder
+  #' @param runName_v optional run name prefix for the file name
+  #' @param sid_v sample ID for the file name and title
+  #' @param print_v logical, print to console
+  
+  ### Output folder and file name
+  umapDir_v <- file.path(qcDir_v, "doublet_umaps")
+  dir.create(umapDir_v, recursive = TRUE, showWarnings = FALSE)
+  prefix_v <- if (!is.null(runName_v)) paste0(runName_v, "_") else ""
+  outFile_v <- file.path(umapDir_v,
+                         paste0(prefix_v, sid_v, "_doublet_umap.png"))
+  
+  ### Quick normalization for the QC UMAP
+  suppressMessages({
+    obj <- NormalizeData(obj, verbose = FALSE)
+    obj <- FindVariableFeatures(obj, nfeatures = 2000, verbose = FALSE)
+    obj <- ScaleData(obj, verbose = FALSE)
+    obj <- RunPCA(obj, npcs = 20, verbose = FALSE)
+    obj <- RunUMAP(obj, dims = 1:20, verbose = FALSE)
+  }) # suppressMessages
+  
+  ### UMAP with doublets drawn on top of the singlets
+  nDbl_v <- sum(obj$scDblFinder.class == "doublet")
+  pct_v <- round(100 * nDbl_v / ncol(obj), 1)
+  plot_gg <- DimPlot(obj, reduction = "umap", group.by = "scDblFinder.class",
+                     cols = c(singlet = "grey75", doublet = "#D55E00"),
+                     order = c("singlet", "doublet")) +
+    ggtitle(sprintf("%s: %d doublets (%.1f%%)", sid_v, nDbl_v, pct_v))
+  
+  ### Print
+  #if (print_v) print(plot_gg)
+  
+  ### Save
+  ggsave(outFile_v, plot_gg, width = 6, height = 5, dpi = 150)
+  
+} # plotDoubletUmap
+```
+
+```{r}
+# This is latest one, need to modify
+removeDoublets <- function(seurat_lsobj, qcDir_v, sampleNameCol_v = "orig.ident", runName_v = NULL, print_v = T) {
+  #' Remove Doublets
+  #' @description remove doublets from seurat objects with scDblFinder (per
+  #' sample, before merging) and save one UMAP per sample colored by
+  #' singlet/doublet
+  #' @param seurat_lsobj list of seurat objects. Can also provide a single object (will get turned into a list w/ one object)
+  #' @param qcDir_v directory to output the qc summary table and doublet UMAPs
+  #' @param runName_v optional run name prefix for output files
+  #' @param print_v logical whether to print QC umap to console or not
+  #' @param sampleNameCol_v where to get sample ID for list construction if only one object given
+  
+  ### Allow a single object instead of a list (name it from its metadata,
+  ### otherwise names(seurat_lsobj) is NULL and the loop below never runs)
+  if (is(seurat_lsobj, "Seurat")) {
+    sid_v <- unique(as.character(seurat_lsobj[[sampleNameCol_v]]))[1]
+    if (is.na(sid_v) || sid_v == "") sid_v <- "sample1"
+    seurat_lsobj <- setNames(list(seurat_lsobj), sid_v)
+  } # fi
+  
+  dbl_rows <- list()
+  seuratOut_lsobj <- list()
+  
+  for (sid in names(seurat_lsobj)) {
+    
+    ### Get an object and its cells
+    obj <- seurat_lsobj[[sid]]
+    nCells_v <- ncol(obj)
+    
+    ### Skip if too small
+    if (nCells_v < 10) {
+      dbl_rows[[sid]] <- data.table(sample_id = sid, cells = nCells_v,
+                                    doublets = 0, pct_doublets = 0)
+      seuratOut_lsobj[[sid]] <- obj
+      next
+    } # fi
+    
+    # One failing sample must not kill the run: keep it unfiltered
+    res <- tryCatch({
+      
+      ### Runs on raw counts (Seurat object converted to a SingleCellExperiment)
+      ### set.seed makes calls reproducible.
+      ### Default dbr.per1k = 0.008 implements the 10x multiplet rate (~0.8% per 1,000 cells)
+      set.seed(42)
+      
+      ### Convert
+      sce <- as.SingleCellExperiment(obj, assay = "RNA")
+      
+      ### Run finder
+      sce <- suppressMessages(scDblFinder::scDblFinder(sce))
+      
+      ### Get order (should always be the same...)
+      m <- match(colnames(obj), colnames(sce))
+      
+      ### Add calls (and scores) to the object metadata, BEFORE removal
+      obj$scDblFinder.class <- as.character(sce$scDblFinder.class)[m]
+      if (!is.null(sce$scDblFinder.score)) {
+        obj$scDblFinder.score <- as.numeric(sce$scDblFinder.score)[m]
+      } # fi
+      
+      ### Per-sample UMAP colored by singlet/doublet (own tryCatch: a plot
+      ### failure must not stop the removal)
+      tryCatch(
+        plotDoubletUmap(obj, qcDir_v, runName_v, sid, print_v),
+        error = function(e) warning(sprintf(
+          "Doublet UMAP failed on %s (removal continues): %s",
+          sid, conditionMessage(e)))
+      ) # tryCatch
+      
+      ### ID doublets
+      is_doublet <- obj$scDblFinder.class == "doublet"
+      
+      ### Output
+      list(obj = obj[, !is_doublet], doublets = sum(is_doublet))
+      
+    }, error = function(e) {
+      
+      warning(sprintf("scDblFinder failed on %s (kept all cells): %s",
+                      sid, conditionMessage(e)))
+      list(obj = obj, doublets = NA_integer_)
+      
+    }) # tryCatch
+    
+    ### Split trycatch output into object and summary
+    seuratOut_lsobj[[sid]] <- res$obj
+    dbl_rows[[sid]] <- data.table(sample_id = sid, cells = nCells_v,
+                                  doublets = res$doublets,
+                                  pct_doublets = if (is.na(res$doublets)) NA_real_
+                                  else round(100 * res$doublets / nCells_v, 2))
+    
+    message(sprintf(" %s: %s doublets (%s%%)", sid, res$doublets,
+                    dbl_rows[[sid]]$pct_doublets))
+  } # for
+  
+  ### Combine output
+  dbl_summary <- rbindlist(dbl_rows)
+  
+  ### Update
+  message(sprintf("Doublet removal done: %s doublets total",
+                  sum(dbl_summary$doublets, na.rm = TRUE)))
+  
+  ### Get name
+  if (!is.null(runName_v)) {
+    outName_v <- paste0(runName_v, "_qc_doublets.csv")
+  } else {
+    outName_v <- "qc_doublets.csv"
+  } # fi
+  
+  ### Write summary
+  writeCSVorExcel(dbl_summary, file.path(qcDir_v, outName_v))
+  
+  ### Return singlets
+  seuratOut_lsobj
+} # removeDoublets
+```
+
+# Summary
+
+In this markdown we will perform the following processing steps:
+
+1. Filter out doublets 
+1. Visualize data to check results of filters
+1. Save finalized seurat object for later use
+
+Must have run part1 first
+
+```{r load_libraries, echo=FALSE, message = FALSE, warning = FALSE}
+library(Seurat)
+library(tidyverse)
+library(Matrix)
+library(wrh.rUtils)
+library(wrh.scRNA)
+library(bluster)
+library(kableExtra)
+library(ggpubr)
+library(scDblFinder)
+library(ggpubr)
+library(data.table)
+library(glmGamPoi)
+options(future.globals.maxSize= 891289600000)
+
+### Local run
+# baseDir_v <- "/Volumes/wrh_padlock3/projects/AP/novogene/"
+# dataDir_v <- file.path(baseDir_v, "align")
+# rdsDir_v <- mkdir(baseDir_v, "rds")
+# qcDir_v <- mkdir(baseDir_v, "qc")
+
+### Exa run
+baseDir_v <- "/home/exacloud/gscratch/CoussensLab/transcriptomic/novogene"
+dataDir_v <- file.path(baseDir_v, "aligned")
+rdsDir_v <- mkdir(baseDir_v, "rds")
+qcDir_v <- mkdir(baseDir_v, "QC")
+
+seuratFile_v <- file.path(rdsDir_v, "filterSamples_genePerCell200_mito15_complexity0.8_noProcess_lsobj.rds")
+
+# Run Flags
+clusterqc_v <- F # Set this is the cluster Sweep has been run already
+minPC_v <- F
+pcName_v <- ifelse(minPC_v, "minPC", "maxPC")
+mt_v <- 15
+print(mt_v)
+
+# Thresholds
+minGenesPerCell_v <- 200
+maxGenesPerCell_v <- 6000
+maxPctMito_v <- 15
+```
+
+# Load
+
+Load samples (1.5 min)
+
+```{r, eval = T}
+seurat_lsobj <- readRDS(seuratFile_v)
+invisible(gc())
+```
+
+# scDblFinder
+
+Run scDblFinder on each sample separately, save a UMAP visualizing the doublets
+
+```{r}
+tictoc::tic()
+seurat_lsobj <- removeDoublets(seurat_lsobj, qcDir_v = qcDir_v)
+tictoc::toc()
+```
+
+
+```{r saveObject}
+outFile_v <- file.path(rdsDir_v, "qcAndDoubletFilter_lsobj.rds")
+tictoc::tic()
+saveRDS(object = seurat_lsobj, file = outFile_v)
+tictoc::toc()
+```
+
+```{r}
+sessionInfo()
+```

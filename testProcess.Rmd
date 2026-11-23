@@ -1,0 +1,394 @@
+---
+title: "Novogene Analysis"
+subtitle: "Process"
+date: " Last updated on `r format(Sys.time(), '%B %d, %Y')`"
+author: "Wes Horton"
+output:
+  html_document:
+    toc: true
+    toc_float: 
+      collapsed: false
+      smooth_scroll: false
+    toc_depth: 3
+    number_sections: true
+---
+
+# Summary
+
+In this markdown we will perform the following processing steps:
+
+1. Filter out doublets 
+1. Visualize data to check results of filters
+1. Save finalized seurat object for later use
+
+Must have run part1 first
+
+```{r load_libraries, echo=FALSE, message = FALSE, warning = FALSE}
+library(Seurat)
+library(tidyverse)
+library(Matrix)
+library(wrh.rUtils)
+library(wrh.scRNA)
+library(bluster)
+library(kableExtra)
+library(ggpubr)
+library(scDblFinder)
+library(ggpubr)
+library(data.table)
+library(glmGamPoi)
+options(future.globals.maxSize= 891289600000)
+
+### Local run
+# baseDir_v <- "/Volumes/wrh_padlock3/projects/AP/novogene/"
+# dataDir_v <- file.path(baseDir_v, "align")
+# rdsDir_v <- mkdir(baseDir_v, "rds")
+# qcDir_v <- mkdir(baseDir_v, "qc")
+
+### Exa run
+baseDir_v <- "/home/exacloud/gscratch/CoussensLab/transcriptomic/novogene"
+dataDir_v <- file.path(baseDir_v, "aligned")
+rdsDir_v <- mkdir(baseDir_v, "rds")
+qcDir_v <- mkdir(baseDir_v, "QC")
+refDir_v <- file.path(baseDir_v, "ref")
+plotDir_v <- mkdir(baseDir_v, "plots/noSketch")
+
+seuratFile_v <- file.path(rdsDir_v, "qcAndDoubletFilter_lsobj.rds")
+
+# Run Flags
+minPC_v <- F
+pcName_v <- ifelse(minPC_v, "minPC", "maxPC")
+```
+
+# Load
+
+Load samples (1.5 min)
+
+```{r, eval = T}
+tictoc::tic()
+seurat_lsobj <- readRDS(seuratFile_v)
+tictoc::toc()
+```
+
+# Split Tissue
+
+```{r, eval = T}
+tictoc::tic()
+tumor_lsobj <- seurat_lsobj[grep("^T", names(seurat_lsobj), value = T)]
+blood_lsobj <- seurat_lsobj[grep("^B", names(seurat_lsobj), value = T)]
+tictoc::toc()
+```
+
+# Merge Tissue - 3 min
+
+```{r, eval = T}
+tictoc::tic()
+tumor_obj <- merge(x = tumor_lsobj[[1]], y = tumor_lsobj[-1])
+blood_obj <- merge(x = blood_lsobj[[1]], y = blood_lsobj[-1])
+tictoc::toc()
+```
+
+# Join Layers - 3 min
+
+```{r, eval = T}
+tictoc::tic()
+tumor_obj <- JoinLayers(tumor_obj, assay = "RNA")
+blood_obj <- JoinLayers(blood_obj, assay = "RNA")
+tictoc::toc()
+```
+
+# Normalize 
+
+```{r, eval = T}
+tictoc::tic()
+tumor_obj <- NormalizeData(tumor_obj) 
+tumor_obj <- FindVariableFeatures(tumor_obj)
+tumor_obj <- ScaleData(tumor_obj)
+tumor_obj <- RunPCA(tumor_obj)
+tumorPcs_v <- findPCs(tumor_obj, ndims_v = 50, min_v = minPC_v)
+tictoc::toc()
+
+tictoc::tic()
+blood_obj <- NormalizeData(blood_obj)
+blood_obj <- FindVariableFeatures(blood_obj)
+blood_obj <- ScaleData(blood_obj)
+blood_obj <- RunPCA(blood_obj)
+bloodPcs_v <- findPCs(blood_obj, ndims_v = 50, min_v = minPC_v)
+
+invisible(gc())
+tictoc::toc()
+```
+
+# Cluster QC
+
+```{r, eval = T}
+# myClusterSweep(seurat_obj = tumor_obj, ndims_v = tumorPcs_v, name_v = "tumor",
+#              indPlots_v = T, plotDir_v = mkdir(qcDir_v, "noSketch_clusterQC"))
+# invisible(gc())
+tumorRes_v <- 0.8
+
+# myClusterSweep(seurat_obj = blood_obj, ndims_v = bloodPcs_v, name_v = "blood",
+#              indPlots_v = T, plotDir_v = mkdir(qcDir_v, "noSketch_clusterQC"))
+# invisible(gc())
+bloodRes_v <- 0.8
+```
+
+# Cluster
+
+```{r, eval = T}
+tictoc::tic()
+tumor_obj <- FindNeighbors(tumor_obj, dims = 1:tumorPcs_v, verbose = F)
+tumor_obj <- FindClusters(tumor_obj, resolution = tumorRes_v, verbose = F)
+tumor_obj <- RunUMAP(tumor_obj, dims = 1:tumorPcs_v, verbose = F, return.model = T)
+tictoc::toc()
+
+tictoc::tic()
+blood_obj <- FindNeighbors(blood_obj, dims = 1:bloodPcs_v, verbose = F)
+blood_obj <- FindClusters(blood_obj, resolution = bloodRes_v, verbose = F)
+blood_obj <- RunUMAP(blood_obj, dims = 1:bloodPcs_v, verbose = F, return.model = T)
+tictoc::toc()
+
+invisible(gc())
+```
+
+# UMAP
+
+## Tumor
+
+```{r}
+tumorByCluster_gg <- DimPlot(tumor_obj, group.by = "seurat_clusters", label = T) + NoLegend() +
+  ggtitle("Tumor - By Cluster")
+
+tumorByTreat_gg <- DimPlot(tumor_obj, group.by = "Treatment", label = F, cols = treatColors_v) + 
+  ggtitle("Tumor - By Treatment")
+
+tumorBySample_gg <- DimPlot(tumor_obj, group.by = "Sample") + NoLegend() +
+  ggtitle("Tumor - By Sample")
+
+tumorByCluster_gg
+tumorByTreat_gg
+tumorBySample_gg
+
+pdf(file = file.path(plotDir_v, "tumorDimPlot.pdf"))
+tumorByCluster_gg
+tumorByTreat_gg
+tumorBySample_gg
+dev.off()
+```
+
+## Blood
+
+```{r}
+bloodByCluster_gg <- DimPlot(blood_obj, group.by = "seurat_clusters", label = T) + NoLegend() +
+  ggtitle("Blood - By Cluster")
+
+bloodByTreat_gg <- DimPlot(blood_obj, group.by = "Treatment", label = F, cols = treatColors_v) + 
+  ggtitle("Blood - By Treatment")
+
+bloodBySample_gg <- DimPlot(blood_obj, group.by = "Sample") + NoLegend() +
+  ggtitle("Blood - By Sample")
+
+bloodByCluster_gg
+bloodByTreat_gg
+bloodBySample_gg
+
+pdf(file = file.path(plotDir_v, "bloodDimPlot.pdf"))
+bloodByCluster_gg
+bloodByTreat_gg
+bloodBySample_gg
+dev.off()
+```
+
+# DotPlot
+
+## Tumor
+
+```{r, fig.width=14, fig.height=16}
+tumorNoSortDot_gg <- DotPlot(tumor_obj,
+        features = unname(dotMarkers_v),
+        cols = "RdYlBu") + 
+  scale_x_discrete(labels = paste(names(dotMarkers_v), unname(dotMarkers_v), sep = "_")) +
+  coord_flip() +
+  ggtitle("Tumor - mPop Markers")
+
+tumorNoSortDot_gg
+```
+
+```{r, fig.width=14, fig.height=16}
+#Order populations after looking at dotplot
+tumorPops_lsv <- list("bcell" = 22,
+                      "tcell" = c(6, 7, 12, 21, 25, 30, 36, 1, 9, 18, 20, 23, 24, 26, 27, 29),
+                      "otherT" = c(14),
+                      "nk" = c(4, 8),
+                      "mdsc" = c(2, 3, 39),
+                      "caf" = c(32),
+                      "endo" = 37,
+                      "tumor" = 19,
+                      "otherMyeloid" = c(0, 5, 10, 11, 13, 15, 16, 17, 28, 31, 33, 34, 35))
+tumorPops_lsv$other <- setdiff(0:41, unlist(tumorPops_lsv, use.names = F))
+
+tumor_obj$sortCluster <- factor(as.character(tumor_obj$seurat_clusters), levels = unlist(tumorPops_lsv, use.names = F))
+```
+
+```{r}
+### Add to object
+tumor_obj$firstPassPop <- character(length = length(tumor_obj$orig.ident))
+for (pop_v in names(tumorPops_lsv)) {
+  clust_v <- tumorPops_lsv[[pop_v]]
+  tumor_obj@meta.data[tumor_obj$seurat_clusters %in% clust_v, "firstPassPop"] <- pop_v
+}
+
+tumorFirstPass_gg <- DimPlot(tumor_obj, group.by = "firstPassPop") + 
+  ggtitle("Tumor - First Pass M Pop")
+
+tumorFirstPass_gg
+
+pdf(file = file.path(plotDir_v, "tumorFirstPassPops.pdf"))
+tumorFirstPass_gg
+dev.off()
+```
+
+```{r, fig.width=14, fig.height=16}
+tumorSortDot_gg <- DotPlot(tumor_obj,
+        features = unname(dotMarkers_v),
+        group.by = "sortCluster",
+        cols = "RdYlBu") + 
+  scale_x_discrete(labels = paste(names(dotMarkers_v), unname(dotMarkers_v), sep = "_")) +
+  coord_flip() +
+  ggtitle("Tumor - mPop Markers")
+
+tumorSortDot_gg
+```
+
+```{r}
+pdf(file = file.path(plotDir_v, "tumorDot.pdf"), width = 14, height = 16)
+tumorNoSortDot_gg
+tumorSortDot_gg
+dev.off()
+```
+
+## Blood
+
+```{r}
+bloodMarkers_v <- dotMarkers_v[!(names(dotMarkers_v) %in% c("tumor", "Caf", "MyoEpi", "Endo"))]
+```
+
+```{r, fig.width=12, fig.height=12}
+bloodNoSortDot_gg <- DotPlot(blood_obj,
+        features = unname(bloodMarkers_v),
+        cols = "RdYlBu") + 
+  scale_x_discrete(labels = paste(names(bloodMarkers_v), unname(bloodMarkers_v), sep = "_")) +
+  coord_flip() +
+  ggtitle("Blood - mPop Markers")
+
+bloodNoSortDot_gg
+```
+
+```{r}
+#Order populations after looking at dotplot
+bloodPops_lsv <- list("bcell" = c(4, 12, 15, 17, 18, 19, 26, 35),
+                      "tb" = c(27),
+                      "tcell" = c(9, 11, 16, 21, 24, 36),
+                      "nk" = c(14),
+                      "mdsc" = c(0:3, 5, 7, 8, 13, 20, 22, 23, 28, 32),
+                      "mono" = c(6, 10, 25, 29, 30, 33),
+                      "otherLymphoid" = c(37),
+                      "otherMyeloid" = c(31, 34, 38, 39, 40))
+bloodPops_lsv$other <- setdiff(0:40, unlist(bloodPops_lsv, use.names = F))
+
+blood_obj$sortCluster <- factor(as.character(blood_obj$seurat_clusters), levels = unlist(bloodPops_lsv, use.names = F))
+```
+
+```{r}
+### Add to object
+blood_obj$firstPassPop <- character(length = length(blood_obj$orig.ident))
+for (pop_v in names(bloodPops_lsv)) {
+  clust_v <- bloodPops_lsv[[pop_v]]
+  blood_obj@meta.data[blood_obj$seurat_clusters %in% clust_v, "firstPassPop"] <- pop_v
+}
+
+bloodFirstPass_gg <- DimPlot(blood_obj, group.by = "firstPassPop") + 
+  ggtitle("Blood - First Pass M Pop")
+
+bloodFirstPass_gg
+
+pdf(file = file.path(plotDir_v, "bloodFirstPassPops.pdf"))
+bloodFirstPass_gg
+dev.off()
+```
+
+```{r, fig.height=12, fig.width=12}
+bloodSortDot_gg <- DotPlot(blood_obj,
+        features = unname(bloodMarkers_v),
+        group.by = "sortCluster",
+        cols = "RdYlBu") + 
+  scale_x_discrete(labels = paste(names(bloodMarkers_v), unname(bloodMarkers_v), sep = "_")) +
+  coord_flip() +
+  ggtitle("Blood - mPop Markers")
+
+bloodSortDot_gg
+```
+
+```{r}
+pdf(file = file.path(plotDir_v, "bloodDot.pdf"), width = 12, height = 16)
+bloodNoSortDot_gg
+bloodSortDot_gg
+dev.off()
+```
+
+# Subset
+
+```{r}
+### Tumor
+tumorPopGroups_lsv <- list("lymphoid" = unlist(tumorPops_lsv[c("bcell", "tcell", "otherT", "nk")]),
+                           "myeloid" = unlist(tumorPops_lsv[c("mdsc", "otherMyeloid")]),
+                           "other" = unlist(tumorPops_lsv[c("caf", "endo", "tumor", "other")]))
+
+subTumor_lsobj <- list()
+for (i in 1:length(tumorPopGroups_lsv)) {
+  
+  currGrpName_v <- names(tumorPopGroups_lsv)[i]
+  currGrpClusters_v <- tumorPopGroups_lsv[[currGrpName_v]]
+  
+  currCells_v <- rownames(tumor_obj@meta.data[tumor_obj$seurat_clusters %in% currGrpClusters_v,])
+  currObj <- subset(tumor_obj, cells = currCells_v)
+  subTumor_lsobj[[currGrpName_v]] <- currObj
+}
+
+### Blood
+bloodPopGroups_lsv <- list("lymphoid" = unlist(bloodPops_lsv[c("bcell", "tcell", "tb", "nk", "otherLymphoid")]),
+                           "myeloid" = unlist(bloodPops_lsv[c("mdsc", "mono", "otherMyeloid")]))
+
+subblood_lsobj <- list()
+for (i in 1:length(bloodPopGroups_lsv)) {
+  
+  currGrpName_v <- names(bloodPopGroups_lsv)[i]
+  currGrpClusters_v <- bloodPopGroups_lsv[[currGrpName_v]]
+  
+  currCells_v <- rownames(blood_obj@meta.data[blood_obj$seurat_clusters %in% currGrpClusters_v,])
+  currObj <- subset(blood_obj, cells = currCells_v)
+  subblood_lsobj[[currGrpName_v]] <- currObj
+}
+```
+
+# Write out objects
+
+```{r}
+tictoc::tic()
+sapply(names(subTumor_lsobj), function(x) saveRDS(subTumor_lsobj[[x]], 
+                                                  file = file.path(rdsDir_v, paste0("fromTumor_", x, ".rds"))))
+tictoc::toc()
+
+tictoc::tic()
+sapply(names(subblood_lsobj), function(x) saveRDS(subblood_lsobj[[x]], 
+                                                  file = file.path(rdsDir_v, paste0("fromBlood_", x, ".rds"))))
+tictoc::toc()
+
+tictoc::tic() # 25 min...
+saveRDS(tumor_obj, file = file.path(rdsDir_v, "tumor_noSketchAndProcess.rds"))
+saveRDS(blood_obj, file = file.path(rdsDir_v, "blood_noSketchAndProcess.rds"))
+tictoc::toc()
+```
+
+```{r}
+sessionInfo()
+```

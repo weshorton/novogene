@@ -1,0 +1,470 @@
+---
+title: "Novogene Analysis"
+subtitle: "Original QC"
+date: " Last updated on `r format(Sys.time(), '%B %d, %Y')`"
+author: "Wes Horton"
+output:
+  html_document:
+    toc: true
+    toc_float: 
+      collapsed: false
+      smooth_scroll: false
+    toc_depth: 3
+    number_sections: true
+---
+
+# Summary
+
+In this markdown we will perform the following processing steps:
+
+1. Load data, initialize objects, wrangle assays (including assigning HTODemux ids)
+1. Visualize various QC metrics
+1. Filter out low-quality cells
+1. Filter out doublets 
+1. Visualize data to check results of filters
+1. Save finalized seurat object for later use
+
+```{r load_libraries, echo=FALSE, message = FALSE, warning = FALSE}
+library(Seurat)
+library(tidyverse)
+library(Matrix)
+library(wrh.rUtils)
+library(wrh.scRNA)
+library(bluster)
+library(kableExtra)
+library(ggpubr)
+library(scDblFinder)
+library(ggpubr)
+library(data.table)
+options(future.globals.maxSize= 891289600000)
+
+### Local run
+# baseDir_v <- "/Volumes/wrh_padlock3/projects/AP/novogene/"
+# dataDir_v <- file.path(baseDir_v, "align")
+# rdsDir_v <- mkdir(baseDir_v, "rds")
+# qcDir_v <- mkdir(baseDir_v, "qc")
+
+### Exa run
+baseDir_v <- "/home/exacloud/gscratch/CoussensLab/transcriptomic/novogene"
+dataDir_v <- file.path(baseDir_v, "aligned")
+rdsDir_v <- mkdir(baseDir_v, "rds")
+qcDir_v <- mkdir(baseDir_v, "QC")
+
+seuratFile_v <- file.path(rdsDir_v, "allSamples_noFilter_lsobj.rds")
+
+# Run Flags
+clusterqc_v <- F # Set this is the cluster Sweep has been run already
+minPC_v <- F
+pcName_v <- ifelse(minPC_v, "minPC", "maxPC")
+mt_v <- 15
+print(mt_v)
+
+# Thresholds
+minGenesPerCell_v <- 200
+maxGenesPerCell_v <- 6000
+maxPctMito_v <- 15
+```
+
+# Load, initialize, wrangle
+
+Load the metadata, remove problem samples, load 10x files and convert to seurat objects
+
+```{r meta, echo = T, results='hide'}
+### Load metadata
+meta_dt <- readAllExcel(file.path(baseDir_v, "novoMeta.xlsx"))$sheet1
+colnames(meta_dt) <- c("MouseID", "Tissue", "Treatment", "Library Type", "Sample", "Sub Library Name", "Delivery Method",
+                       "I7-index", "I5-index", "Insert Size", "Library Status", "Total Data Amt", "Data Unit", 
+                       "Concentration", "Volume", "Species Type", "Notes")
+
+meta_dt <- meta_dt[,mget(c("MouseID", "Tissue", "Treatment", "Sample", "Concentration", "Volume"))]
+```
+
+```{r subset meta}
+badSamples_v <- c("B47", "B48")
+meta_dt <- meta_dt[!(`Sample` %in% badSamples_v),]
+```
+
+```{r load data}
+if (!file.exists(seuratFile_v)) {
+
+  novo_lsobj <- list()
+  for (i in 1:nrow(meta_dt)) {
+    
+    ### Get a sample and its path
+    currSample_v <- meta_dt$Sample[i]
+    currPath_v <- file.path(dataDir_v, currSample_v, "filtered_feature_bc_matrix/filtered_feature_bc_matrix.h5")
+    
+    ### Read it in and convert to Seurat
+    curr10x <- Read10X_h5(filename = currPath_v)
+    currObj <- CreateSeuratObject(curr10x, project = currSample_v, min.cells = 3, min.features = 100)
+    
+    ### Add meta info
+    currObj$mouseID <- meta_dt[Sample == currSample_v, MouseID]
+    currObj$Tissue <- meta_dt[Sample == currSample_v, Tissue]
+    currObj$Treatment <- meta_dt[Sample == currSample_v, Treatment]
+    currObj$Sample <- currObj$orig.ident
+    
+    ### Add mito pct
+    currObj$percent.mt <- PercentageFeatureSet(currObj, pattern = "^mt-")
+    
+    ### Add to list
+    novo_lsobj[[currSample_v]] <- currObj
+    
+  } # for i
+  
+  saveRDS(novo_lsobj, file = seuratFile_v)
+  
+} else {
+  
+  novo_lsobj <- readRDS(seuratFile_v)
+  
+}
+```
+
+# Basic QC
+
+```{r}
+### Add complexity calculation
+novo_lsobj <- lapply(novo_lsobj, function(x) {
+  x$log10GenesPerUMI <- log10(x$nFeature_RNA) / log10(x$nCount_RNA)
+  return(x)})
+```
+
+```{r}
+### Get Basic summary statistics
+qcSummary_df <- rbindlist(lapply(names(novo_lsobj), function(x) {
+  obj <- novo_lsobj[[x]]
+  data.table(Sample = x,
+             cellsBefore = ncol(obj),
+             medGenes = median(obj$nFeature_RNA),
+             medMito = median(obj$percent.mt))
+}))
+```
+
+```{r QC plots}
+### Combine all the metadata for plotting
+cellMeta_df <- rbindlist(lapply(novo_lsobj, function(x) x@meta.data))
+cellMeta_df$Treatment <- factor(cellMeta_df$Treatment, levels = intersect(names(treatColors_v), unique(cellMeta_df$Treatment)))
+setorder(cellMeta_df, Treatment)
+cellMeta_df$Sample <- factor(cellMeta_df$Sample, levels = unique(cellMeta_df$Sample))
+
+preFilterQCDir_v <- mkdir(qcDir_v, "preFilter")
+```
+
+```{r umi}
+### Plot UMI (nCount RNA)
+nCountRNA_vln_gg <- ggplot(cellMeta_df, aes(x = Sample, y = nCount_RNA, fill = Treatment)) +
+  geom_violin() + 
+  facet_wrap(~Tissue, scales = "free_x") + 
+  ggtitle("UMI (nCount RNA)") +
+  scale_fill_manual(values = treatColors_v, breaks = names(treatColors_v))
+
+nCountRNA_vln_log10_gg <- nCountRNA_vln_gg + scale_y_continuous(trans = "log10", labels = scales::label_comma())
+
+### Plot as density
+nCountRNA_density_gg <- ggplot(data = cellMeta_df, aes(color = Treatment, x = nCount_RNA, fill = Treatment)) +
+  geom_density(alpha = 0.2) + scale_x_log10(labels = scales::label_comma()) + my_theme() +
+  facet_wrap(~Tissue) +
+  ylab("Cell density") + geom_vline(xintercept = c(500, 1000, 1500)) +
+  scale_color_manual(values = treatColors_v, breaks = names(treatColors_v)) +
+  scale_fill_manual(values = treatColors_v, breaks = names(treatColors_v)) +
+  ggtitle("Number of UMIs per cell\n(x-int = 500, 1000, 1500)")
+```
+
+```{r features}
+nFeatureRNA_vln_gg <- ggplot(cellMeta_df, aes(x = Sample, y = nFeature_RNA, fill = Treatment)) +
+  geom_violin() + 
+  facet_wrap(~Tissue, scales = "free_x") + 
+  ggtitle("Genes (nFeature RNA)") +
+  scale_y_continuous(labels = scales::label_comma()) + 
+  scale_fill_manual(values = treatColors_v, breaks = names(treatColors_v))
+
+nFeatureRNA_vln_log10_gg <- nFeatureRNA_vln_gg + scale_y_continuous(trans = "log10", labels = scales::label_comma())
+
+### Plot as density
+nFeatureRNA_density_gg <- ggplot(data = cellMeta_df, aes(color = Treatment, x = nFeature_RNA, fill = Treatment)) +
+  geom_density(alpha = 0.2) + scale_x_log10(labels = scales::label_comma()) + my_theme() +
+  facet_wrap(~Tissue) +
+  ylab("Cell density") + geom_vline(xintercept = c(500, 1000, 1500)) +
+  scale_color_manual(values = treatColors_v, breaks = names(treatColors_v)) +
+  scale_fill_manual(values = treatColors_v, breaks = names(treatColors_v)) +
+  ggtitle("Number of Genes per cell\n(x-int = 500, 1000, 1500)")
+```
+
+```{r mito pct}
+pctMito_vln_gg <- ggplot(cellMeta_df, aes(x = Sample, y = percent.mt, fill = Treatment)) +
+  geom_violin() + 
+  facet_wrap(~Tissue, scales = "free_x") + 
+  ggtitle("Percent Mito") +
+  scale_y_continuous(labels = scales::label_comma()) + 
+  scale_fill_manual(values = treatColors_v, breaks = names(treatColors_v))
+
+pctMito_vln_log10_gg <- pctMito_vln_gg + scale_y_continuous(trans = "log10", labels = scales::label_comma())
+
+### Plot as density
+pctMito_density_gg <- ggplot(data = cellMeta_df, aes(color = Treatment, x = percent.mt, fill = Treatment)) +
+  geom_density(alpha = 0.2) + scale_x_log10(labels = scales::label_comma()) + my_theme() +
+  #facet_wrap(~Tissue) +
+  facet_grid(rows = vars(Treatment), cols = vars(Tissue)) +
+  ylab("Cell density") + geom_vline(xintercept = c(10, 15, 25)) +
+  scale_color_manual(values = treatColors_v, breaks = names(treatColors_v)) +
+  scale_fill_manual(values = treatColors_v, breaks = names(treatColors_v)) +
+  ggtitle("Pct Mitochondrial per cell (x-int = 10, 15, 25)")
+```
+
+```{r vs Gene}
+transcriptByGene_gg <- ggplot(cellMeta_df, aes(x = nCount_RNA, y = nFeature_RNA, color = Treatment)) +
+  geom_point(size = 0.2) + facet_wrap(~Tissue) +
+  geom_vline(xintercept = 500) + geom_hline(yintercept = 200) + geom_hline(yintercept = 300) +
+  scale_x_log10(labels = scales::label_comma()) + scale_y_log10(labels = scales::label_comma()) +
+  ggtitle("Transcripts (UMI) by Feature (Gene)\ny-int 200 and 300")
+
+mitoByGene_gg <- ggplot(cellMeta_df, aes(x = nFeature_RNA, y = percent.mt, color = Treatment)) +
+  geom_point(size = 0.2) + facet_wrap(~Tissue) +
+  geom_hline(yintercept = c(15, 20, 25, 30)) +
+  geom_vline(xintercept = 200) +
+  ggtitle("Features (Gene) by Mito Pct")
+
+mitoByGene_log10_gg <- mitoByGene_gg + scale_x_continuous(trans = "log10", labels = scales::label_comma())
+
+mitoByUMI_gg <- ggplot(cellMeta_df, aes(x = nCount_RNA, y = percent.mt, color = Treatment)) +
+  geom_point(size = 0.2) + facet_wrap(~Tissue) +
+  geom_hline(yintercept = c(15, 20, 25, 30)) +
+  geom_vline(xintercept = 200) +
+  ggtitle("Transcripts (UMIs) by Mito Pct")
+
+mitoByUMI_log10_gg <- mitoByUMI_gg + scale_x_continuous(trans = "log10", labels = scales::label_comma())
+
+complexity_gg <- ggplot(data = cellMeta_df, aes(x = log10GenesPerUMI, color = Sample, fill = Sample)) +
+  facet_grid(rows = vars(Treatment), cols = vars(Tissue)) +
+  geom_density(alpha = 0.2) + my_theme() +
+  geom_vline(xintercept = 0.8) + ggtitle("Complexity per Cell")
+```
+
+## UMIs (transcripts)
+
+```{r printUMI, echo = F, message=F, fig.width=13, fig.height=6}
+nCountRNA_vln_gg
+nCountRNA_vln_log10_gg
+nCountRNA_density_gg
+
+pdf(file = file.path(preFilterQCDir_v, "umi_tissueTreat.pdf"), width = 13, height = 6)
+nCountRNA_vln_gg
+nCountRNA_vln_log10_gg
+nCountRNA_density_gg
+dev.off()
+```
+
+## Genes
+
+```{r printGene, echo = F, message=F, fig.width=13, fig.height=6}
+nFeatureRNA_vln_gg
+nFeatureRNA_vln_log10_gg
+nFeatureRNA_density_gg
+
+pdf(file = file.path(preFilterQCDir_v, "gene_tissueTreat.pdf"), width = 13, height = 6)
+nFeatureRNA_vln_gg
+nFeatureRNA_vln_log10_gg
+nFeatureRNA_density_gg
+dev.off()
+```
+
+## Pct Mito
+
+```{r printMito, echo = F, message=F, fig.width=13, fig.height=6}
+pctMito_vln_gg
+pctMito_vln_log10_gg
+pctMito_density_gg
+
+pdf(file = file.path(preFilterQCDir_v, "mitoPct_tissueTreat.pdf"), width = 13, height = 6)
+pctMito_vln_gg
+pctMito_vln_log10_gg
+pctMito_density_gg
+dev.off()
+```
+
+## Compare Mito/UMI/Gene
+
+```{r scatter, echo = F, message = F, fig.width=10}
+transcriptByGene_gg
+mitoByGene_gg
+mitoByUMI_gg
+
+pdf(file = file.path(preFilterQCDir_v, "scatterCorr_tissueTreat.pdf"), width = 13, height = 6)
+transcriptByGene_gg
+mitoByGene_gg
+mitoByUMI_gg
+dev.off()
+```
+
+## Complexity
+
+```{r complexity, echo = F, message = F, fig.width=10}
+complexity_gg
+
+pdf(file = file.path(preFilterQCDir_v, "complexity_tissueTreat.pdf"), width = 10, height = 7)
+complexity_gg
+dev.off()
+```
+
+# Subset
+
+```{r}
+invisible(gc())
+### Filter objects based on standard thresholds
+filter_lsobj <- lapply(novo_lsobj, function(x) {
+  subset(x, subset = nFeature_RNA >= minGenesPerCell_v &
+           #nFeature_RNA <= maxGenesPerCell_v &
+           percent.mt <= maxPctMito_v)
+})
+
+### Evaluate number of cells removed
+qcSummary_df[, cellsAfter := vapply(filter_lsobj, ncol, numeric(1))]
+qcSummary_df[, pctRemoved := round(100 * (cellsBefore - cellsAfter) / cellsBefore, 1)]
+
+### Check if we removed too many
+filterWarning <- qcSummary_df[pctRemoved > 50]
+if (nrow(filterWarning)) warning(sprintf("Some samples had >50%% cells removed: %s\n", paste(filterWarning$Sample, collapse = ", ")))
+
+### Regardless of percentage, also need to make sure each sample still has minimum number of cells
+filterKeeps <- vapply(filter_lsobj, ncol, numeric(1)) >= 500 # returns false if less than 500 cells
+if (any(!filterKeeps)) message(sprintf("Dropping samples with <500 cells post-QC filter: %s\n", paste(names(filter_lsobj)[!filterKeeps], collapse = ", ")))
+filter_lsobj <- filter_lsobj[filterKeeps]
+```
+
+```{r}
+### Clean memory
+rm(novo_lsobj)
+invisible(gc())
+```
+
+```{r subset}
+### Apply complexity filter
+subset_lsobj <- lapply(filter_lsobj, function(x) subset(x, subset = log10GenesPerUMI >= 0.8))
+
+### Combine all the metadata for plotting
+subCellMeta_df <- rbindlist(lapply(subset_lsobj, function(x) x@meta.data))
+subCellMeta_df$Treatment <- factor(subCellMeta_df$Treatment, levels = intersect(names(treatColors_v), unique(subCellMeta_df$Treatment)))
+setorder(subCellMeta_df, Treatment)
+subCellMeta_df$Sample <- factor(subCellMeta_df$Sample, levels = unique(subCellMeta_df$Sample))
+
+postFilterQCDir_v <- mkdir(qcDir_v, "postFilter")
+```
+
+```{r}
+### Clean memory
+rm(filter_lsobj)
+invisible(gc())
+```
+
+# Check Subset
+
+```{r, checkSubset, echo = F}
+sub_nCountRNA_density_gg <- ggplot(data = subCellMeta_df, aes(color = Treatment, x = nCount_RNA, fill = Treatment)) +
+  geom_density(alpha = 0.2) + scale_x_log10(labels = scales::label_comma()) + my_theme() +
+  facet_wrap(~Tissue) +
+  ylab("Cell density") + geom_vline(xintercept = c(500, 1000, 1500)) +
+  scale_color_manual(values = treatColors_v, breaks = names(treatColors_v)) +
+  scale_fill_manual(values = treatColors_v, breaks = names(treatColors_v)) +
+  ggtitle("Density of UMIs per cell\n(x-int = 500, 1000, 1500)")
+
+sub_nFeatureRNA_density_gg <- ggplot(data = subCellMeta_df, aes(color = Treatment, x = nFeature_RNA, fill = Treatment)) +
+  geom_density(alpha = 0.2) + scale_x_log10(labels = scales::label_comma()) + my_theme() +
+  facet_wrap(~Tissue) +
+  ylab("Cell density") + geom_vline(xintercept = c(500, 1000, 1500)) +
+  scale_color_manual(values = treatColors_v, breaks = names(treatColors_v)) +
+  scale_fill_manual(values = treatColors_v, breaks = names(treatColors_v)) +
+  ggtitle("Number of Genes per cell\n(x-int = 500, 1000, 1500)")
+
+sub_complexity_gg <- ggplot(data = subCellMeta_df, aes(x = log10GenesPerUMI, color = Sample, fill = Sample)) +
+  facet_grid(rows = vars(Treatment), cols = vars(Tissue)) +
+  geom_density(alpha = 0.2) + my_theme() +
+  geom_vline(xintercept = 0.8) + ggtitle("Complexity per Cell")
+
+sub_pctMito_density_gg <- ggplot(data = subCellMeta_df, aes(color = Treatment, x = percent.mt, fill = Treatment)) +
+  geom_density(alpha = 0.2) + scale_x_log10(labels = scales::label_comma()) + my_theme() +
+  #facet_wrap(~Tissue) +
+  facet_grid(rows = vars(Treatment), cols = vars(Tissue)) +
+  ylab("Cell density") + geom_vline(xintercept = c(10, 15, 25)) +
+  scale_color_manual(values = treatColors_v, breaks = names(treatColors_v)) +
+  scale_fill_manual(values = treatColors_v, breaks = names(treatColors_v)) +
+  ggtitle("Pct Mitochondrial per cell (x-int = 10, 15, 25)")
+
+sub_transcriptByGene_gg <- ggplot(subCellMeta_df, aes(x = nCount_RNA, y = nFeature_RNA, color = Treatment)) +
+  geom_point(size = 0.2) + facet_wrap(~Tissue) +
+  geom_vline(xintercept = 500) + geom_hline(yintercept = 200) + geom_hline(yintercept = 300) +
+  scale_x_log10(labels = scales::label_comma()) + scale_y_log10(labels = scales::label_comma()) +
+  ggtitle("Transcripts (UMI) by Feature (Gene)\ny-int 200 and 300")
+```
+
+```{r printCheckSubset, echo = F}
+sub_nCountRNA_density_gg
+sub_nFeatureRNA_density_gg
+sub_complexity_gg
+sub_pctMito_density_gg
+sub_transcriptByGene_gg
+
+pdf(file = file.path(postFilterQCDir_v, "postFilterQC_tissueTreat.pdf"), width = 13, height = 6)
+sub_nCountRNA_density_gg
+sub_nFeatureRNA_density_gg
+sub_complexity_gg
+sub_pctMito_density_gg
+sub_transcriptByGene_gg
+dev.off()
+```
+
+```{r}
+### Clean memory
+invisible(gc())
+
+saveRDS(object = subset_lsobj, file = file.path(rdsDir_v, "filterSamples_genePerCell200_mito15_complexity0.8_noProcess_lsobj.rds"))
+```
+
+# How many cells are lost if we restrict to 500 genes?
+
+```{r test subset, fig.width=12, fig.height=8, eval = F}
+### Apply 500 gene minimum
+testSub_ls <- lapply(subset_lsobj, function(x) subset(x, nFeature_RNA >= 500))
+
+### Get number of cells from 200 and 500 gene minimums
+filterStandard_v <- sapply(subset_lsobj, ncol)
+filter500_v <- sapply(testSub_ls, ncol)
+
+### Build a table of those and find their differences
+filterCheck_dt <- data.table("Sample" = names(filterStandard_v), "pre" = filterStandard_v, "post" = filter500_v)
+filterCheck_dt[, diff := pre - post]
+filterCheck_dt[, pctDiff := round(diff/pre*100, 2)]
+
+### Don't forget the treatments
+filterCheck_dt <- merge(meta_dt[,mget(c("Treatment", "Sample"))], filterCheck_dt, by = "Sample", sort = F)
+
+### Add a label for the high values
+filterCheck_dt[pctDiff > 3, label := Sample]
+
+colnames(filterCheck_dt) <- c("Sample", "Treatment", "Pre-Filter nCells", "Post-Filter nCells", "diff nCells", "pctDiff nCells", "label")
+
+plotMelt_dt <- melt(filterCheck_dt, id.vars = c("Sample", "Treatment", "label"))
+
+min500_gg <- ggplot(plotMelt_dt, aes(x = Treatment, y = value)) + 
+  geom_boxplot(aes(fill = Treatment)) +
+  geom_text_repel(aes(label = label)) +
+  geom_point() +
+  scale_fill_manual(values = treatColors_v, breaks = names(treatColors_v)) +
+  facet_wrap(~variable, scales = "free") +
+  my_theme() +
+  ggtitle("Difference b/w 200 and 500 nFeature")
+
+min500_gg
+
+ggplot(filterCheck_dt, aes(x = `Pre-Filter nReads`, y = `pctDiff nReads`, color = Treatment)) +
+  geom_point() +
+  scale_color_manual(values = treatColors_v, breaks = names(treatColors_v)) +
+  geom_text_repel(aes(label = label))
+
+rm(testSub_lsobj)
+invisible(gc())
+```
+
+```{r}
+sessionInfo()
+```

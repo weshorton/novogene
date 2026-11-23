@@ -1,0 +1,508 @@
+---
+title: "Novogene Analysis"
+subtitle: "Subcluster"
+date: " Last updated on `r format(Sys.time(), '%B %d, %Y')`"
+author: "Wes Horton"
+output:
+  html_document:
+    toc: true
+    toc_float: 
+      collapsed: false
+      smooth_scroll: false
+    toc_depth: 3
+    number_sections: true
+---
+
+# Summary
+
+Load in the major population splits and re-process, re-cluster them.
+
+Tumor source:
+1.
+1.
+1.
+1.
+
+Blood Source:
+1. Lymphoid
+1. Myeloid
+
+
+```{r load_libraries, echo=FALSE, message = FALSE, warning = FALSE}
+library(Seurat)
+library(tidyverse)
+library(Matrix)
+library(wrh.rUtils)
+library(wrh.scRNA)
+library(bluster)
+library(SingleR)
+library(kableExtra)
+library(ggpubr)
+library(scDblFinder)
+library(ggpubr)
+library(data.table)
+library(glmGamPoi)
+options(future.globals.maxSize= 891289600000)
+
+### Local run
+# baseDir_v <- "/Volumes/wrh_padlock3/projects/AP/novogene/"
+
+### Exa run
+baseDir_v <- "/home/exacloud/gscratch/CoussensLab/transcriptomic/novogene"
+dataDir_v <- file.path(baseDir_v, "aligned")
+rdsDir_v <- mkdir(baseDir_v, "rds")
+qcDir_v <- mkdir(baseDir_v, "QC")
+refDir_v <- file.path(baseDir_v, "ref")
+plotDir_v <- mkdir(baseDir_v, "plots/noSketch")
+
+### Get files
+allFiles_v <- list.files(rdsDir_v, pattern = "from")
+tumorFiles_v <- grep("Tumor", allFiles_v, value = T)
+bloodFiles_v <- grep("Blood", allFiles_v, value = T)
+
+# Run Flags
+minPC_v <- T
+pcName_v <- ifelse(minPC_v, "minPC", "maxPC")
+```
+
+```{r}
+### only load this if already run the rest
+subDir_v <- file.path(rdsDir_v, "subProcessed")
+files_v <- list.files(subDir_v)
+
+all_lslsobj <- list("Tumor" = lapply(files_v, function(x) readRDS(file.path(subDir_v, x))))
+names(all_lslsobj$Tumor) <- gsub("fromTumor_|\\.rds", "", files_v)
+```
+
+# Load
+
+Load samples
+
+```{r, eval = T}
+tictoc::tic()
+tumor_lsobj <- sapply(tumorFiles_v, function(x) readRDS(file.path(rdsDir_v, x)), simplify = F, USE.NAMES = T)
+names(tumor_lsobj) <- gsub("fromTumor_|\\.rds", "", names(tumor_lsobj))
+tictoc::toc()
+
+# tictoc::tic()
+# blood_lsobj <- sapply(bloodFiles_v, function(x) readRDS(file.path(rdsDir_v, x)), simplify = F, USE.NAMES = T)
+# names(blood_lsobj) <- gsub("fromBlood_|\\.rds", "", names(blood_lsobj))
+# tictoc::toc()
+```
+
+```{r}
+# all_lslsobj <- list("Tumor" = tumor_lsobj, "Blood" = blood_lsobj)
+# rm(tumor_lsobj, blood_lsobj)
+
+all_lslsobj <- list("Tumor" = tumor_lsobj)
+rm(tumor_lsobj)
+invisible(gc())
+```
+
+# Normalize 
+
+```{r}
+pcs_lslsv <- list()
+for (i in 1:length(all_lslsobj)) {
+  
+  ### Get tissue name and object list
+  currTissue_v <- names(all_lslsobj)[i]
+  currTissue_lsobj <- all_lslsobj[[currTissue_v]]
+  currTissuePcs_lsv <- list()
+  
+  ### Run first half of normalization procedure on each major population
+  for (j in 1:length(currTissue_lsobj)) {
+    
+    ### Get major population object
+    currPop_v <- names(currTissue_lsobj)[j]
+    currPop_obj <- currTissue_lsobj[[currPop_v]]
+    
+    ### Normalize
+    currPop_obj <- NormalizeData(currPop_obj, verbose = F) 
+    currPop_obj <- FindVariableFeatures(currPop_obj)
+    currPop_obj <- ScaleData(currPop_obj)
+    currPop_obj <- RunPCA(currPop_obj)
+    currPopPcs_v <- findPCs(currPop_obj, ndims_v = 50, min_v = minPC_v)
+    
+    ### Update/add
+    currTissue_lsobj[[currPop_v]] <- currPop_obj
+    currTissuePcs_lsv[[currPop_v]] <- currPopPcs_v
+    
+    invisible(gc())
+    
+  } # for j
+  
+  ### Update/add
+  all_lslsobj[[currTissue_v]] <- currTissue_lsobj
+  pcs_lslsv[[currTissue_v]] <- currTissuePcs_lsv
+  
+} # for i
+```
+
+# Cluster QC
+
+```{r}
+clusterQCDir_v <- mkdir(qcDir_v, "subClusterQCSweep_minPC")
+
+for (i in 1:length(all_lslsobj)) {
+  
+  ### Get tissue name and object list
+  currTissue_v <- names(all_lslsobj)[i]
+  currTissue_lsobj <- all_lslsobj[[currTissue_v]]
+  currTissuePcs_lsv <- pcs_lslsv[[currTissue_v]]
+  currBaseDir_v <- mkdir(clusterQCDir_v, currTissue_v)
+  
+  ### Run cluster QC
+  for (j in 1:length(currTissue_lsobj)) {
+    
+    ### Get major population object
+    currPop_v <- names(currTissue_lsobj)[j]
+    currPop_obj <- currTissue_lsobj[[currPop_v]]
+    currPcs_v <- currTissuePcs_lsv[[currPop_v]]
+    currOutDir_v <- mkdir(currBaseDir_v, currPop_v)
+    
+    ### Cluster Sweep
+    myClusterSweep(seurat_obj = currPop_obj, ndims_v = currPcs_v, name_v = currPop_v,
+                   indPlots_v = T, plotDir_v = currOutDir_v)
+    invisible(gc())
+    
+  } # for j
+
+} # for i
+```
+
+```{r}
+# res_lslsv <- list("Tumor" = list("lymphoid" = 0.3, "myeloid" = 0.3, "other" = 0.1),
+#                   "Blood" = list())
+
+res_lslsv <- list("Tumor" = list("lymphoid" = 0.3, "myeloid" = 0.3, "other" = 0.1))
+```
+
+# Cluster
+
+```{r}
+for (i in 1:length(all_lslsobj)) {
+  
+  ### Get tissue name and object list
+  currTissue_v <- names(all_lslsobj)[i]
+  currTissue_lsobj <- all_lslsobj[[currTissue_v]]
+  currTissuePcs_lsv <- pcs_lslsv[[currTissue_v]]
+  currTissueRes_lsv <- res_lslsv[[currTissue_v]]
+  
+  ### Run first half of normalization procedure on each major population
+  for (j in 1:length(currTissue_lsobj)) {
+    
+    ### Get major population object
+    currPop_v <- names(currTissue_lsobj)[j]
+    currPop_obj <- currTissue_lsobj[[currPop_v]]
+    currPopPcs_v <- currTissuePcs_lsv[[currPop_v]]
+    currPopRes_v <- currTissueRes_lsv[[currPop_v]]
+    
+    ### Cluster
+    currPop_obj <- FindNeighbors(currPop_obj, dims = 1:currPopPcs_v, verbose = F)
+    currPop_obj <- FindClusters(currPop_obj, resolution = currPopRes_v, verbose = F)
+    currPop_obj <- RunUMAP(currPop_obj, dims = 1:currPopPcs_v, verbose = F, return.model = T)
+    
+    ### Update
+    currTissue_lsobj[[currPop_v]] <- currPop_obj
+    
+  } # for j
+  
+  ### Update
+  all_lslsobj[[currTissue_v]] <- currTissue_lsobj
+  
+} # for i
+```
+
+# UMAP
+
+```{r}
+umapDir_v <- mkdir(plotDir_v, "subClusterUMAP")
+
+for (i in 1:length(all_lslsobj)) {
+  
+  ### Get tissue name and object list
+  currTissue_v <- names(all_lslsobj)[i]
+  currTissue_lsobj <- all_lslsobj[[currTissue_v]]
+  currUMAPOutDir_v <- mkdir(umapDir_v, currTissue_v)
+  
+  ### UMAP per major pop
+  for (j in 1:length(currTissue_lsobj)) {
+    
+    ### Get major population object
+    currPop_v <- names(currTissue_lsobj)[j]
+    currPop_obj <- currTissue_lsobj[[currPop_v]]
+    
+    ### Make Plot
+    currDim_gg <- DimPlot(currPop_obj, group.by = "seurat_clusters", label = T) +
+      ggtitle(paste0(currTissue_v, " - ", currPop_v))
+    
+    ### Print Plot
+    print(currDim_gg)
+    
+    ### Save Plot
+    pdf(file = file.path(currUMAPOutDir_v, paste0(currPop_v, "_dimPlot.pdf")))
+    print(currDim_gg)
+    dev.off()
+    
+  } # for j
+  
+} # for i
+```
+
+# UMAP - mpop clusters
+
+```{r}
+umapDir_v <- mkdir(plotDir_v, "subClusterUMAP")
+
+for (i in 1:length(all_lslsobj)) {
+  
+  ### Get tissue name and object list
+  currTissue_v <- names(all_lslsobj)[i]
+  currTissue_lsobj <- all_lslsobj[[currTissue_v]]
+  currUMAPOutDir_v <- mkdir(umapDir_v, currTissue_v)
+  
+  ### UMAP per major pop
+  for (j in 1:length(currTissue_lsobj)) {
+    
+    ### Get major population object
+    currPop_v <- names(currTissue_lsobj)[j]
+    currPop_obj <- currTissue_lsobj[[currPop_v]]
+    
+    ### Make Plot
+    currDim_gg <- DimPlot(currPop_obj, group.by = "firstPassPop", label = T) +
+      ggtitle(paste0(currTissue_v, " - ", currPop_v))
+    
+    ### Print Plot
+    print(currDim_gg)
+    
+    ### Save Plot
+    pdf(file = file.path(currUMAPOutDir_v, paste0(currPop_v, "_dimPlotMPops.pdf")))
+    print(currDim_gg)
+    dev.off()
+    
+  } # for j
+  
+} # for i
+```
+
+# Dotplot
+
+Unsorted first
+
+```{r, fig.height=20, fig.width=8}
+dotDir_v <- mkdir(plotDir_v, "subClusterDot")
+# dotList_lsv <- list("lymphoid" = lymphoidMinorPopGenes_v,
+#                     "myeloid" = myeloidMinorPopGenes_v,
+#                     "other" = dotMarkers_v)
+
+dotList_lsv <- list("lymphoid" = allDotMarkers_lsv,
+                    "myeloid" = myeloidMarkers_lsv,
+                    "other" = list("other" = dotMarkers_v))
+
+dotHeight_lsv <- list("lymphoid" = list("Tmajor" = 30, "Tsub" = 28, "Bsub" = 10),
+                      "myeloid" = list("subAll" = 50, "subMacs" = 30, "subDCs" = 10, "subNeuMDSCs" = 14),
+                      "other" = list("other" = 20))
+
+for (i in 1:length(all_lslsobj)) {
+  
+  ### Get tissue name and object list
+  currTissue_v <- names(all_lslsobj)[i]
+  currTissue_lsobj <- all_lslsobj[[currTissue_v]]
+  currOutDir_v <- mkdir(dotDir_v, currTissue_v)
+  
+  ### Dot per major pop
+  for (j in 1:length(currTissue_lsobj)) {
+    
+    ### Get major population object
+    currPop_v <- names(currTissue_lsobj)[j]
+    currPop_obj <- currTissue_lsobj[[currPop_v]]
+    currList_lsv <- dotList_lsv[[currPop_v]]
+    currHeight_lsv <- dotHeight_lsv[[currPop_v]]
+    
+    ### Make Plot
+    for (k in 1:length(currList_lsv)) {
+      
+      currList_v <- currList_lsv[[k]]
+      currHeight_v <- currHeight_lsv[[k]]
+      
+      currDot_gg <- DotPlot(currPop_obj, 
+                            group.by = "seurat_clusters",
+                            features = unname(currList_v),
+                            cols = "RdYlBu") +
+        coord_flip() +
+        scale_x_discrete(labels = paste(names(currList_v), unname(currList_v), sep = "_")) + 
+        ggtitle(paste0(currTissue_v, " - ", currPop_v, " - ", names(currList_lsv)[k], " Markers"))
+      
+      ### Print Plot
+      print(currDot_gg)
+      
+      ### Save Plot
+      pdf(file = file.path(currOutDir_v, paste0(currPop_v, "_", names(currList_lsv)[k], "Markers_dimPlot.pdf")),
+          width = 8, height = currHeight_v)
+      print(currDot_gg)
+      dev.off()
+    } # for k
+    
+  } # for j
+  
+} # for i
+```
+
+# Assign prelim groups
+
+```{r}
+```
+
+# Sorted dots
+
+```{r, eval = F}
+dotDir_v <- mkdir(plotDir_v, "subClusterDot")
+
+for (i in 1:length(all_lslsobj)) {
+  
+  ### Get tissue name and object list
+  currTissue_v <- names(all_lslsobj)[i]
+  currTissue_lsobj <- all_lslsobj[[currTissue_v]]
+  currOutDir_v <- mkdir(dotDir_v, currTissue_v)
+  
+  ### Dot per major pop
+  for (j in 1:length(currTissue_lsobj)) {
+    
+    ### Get major population object
+    currPop_v <- names(currTissue_lsobj)[j]
+    currPop_obj <- currTissue_lsobj[[currPop_v]]
+    
+    ### Make Plot
+    currDot_gg <- DotPlot(currPop_obj, 
+                          group.by = "sortedPop",
+                          features = unname(currList_v),
+                          cols = "RdYlBu") +
+      coord_flip() +
+      # scale_x_discrete(labels = paste(names(currList_v), unname(currList_v), sep = "_")) + # not sure if I want/can do this, just saving for reference.
+      ggtitle(paste0(currTissue_v, " - ", currPop_v))
+    
+    ### Print Plot
+    print(currDot_gg)
+    
+    ### Save Plot
+    pdf(file = file.path(currOutDir_v, paste0(currPop_v, "_dimPlot.pdf")))
+    print(currDim_gg)
+    dev.off()
+    
+  } # for j
+  
+} # for i
+```
+
+# Final groups
+
+```{r, eval = F}
+finalPops_lslsv <- list("Tumor" = list(),
+                        "Blood" = list())
+```
+
+# Final UMAPs
+
+```{r, eval = F}
+finalUmapDir_v <- mkdir(plotDir_v, "subClusterUMAP_final")
+
+# Just copied from above, hasn't been edited
+# for (i in 1:length(all_lslsobj)) {
+#   
+#   ### Get tissue name and object list
+#   currTissue_v <- names(all_lslsobj)[i]
+#   currTissue_lsobj <- all_lslsobj[[currTissue_v]]
+#   currOutDir_v <- mkdir(umapDir_v, currTissue_v)
+#   
+#   ### UMAP per major pop
+#   for (j in 1:length(currTissue_lsobj)) {
+#     
+#     ### Get major population object
+#     currPop_v <- names(currTissue_lsobj)[j]
+#     currPop_obj <- currTissue_lsobj[[currPop_v]]
+#     
+#     ### Make Plot
+#     currDim_gg <- DimPlot(currPop_obj, group.by = "seurat_clusters.1") +
+#       ggtitle(paste0(currTissue_v, " - ", currPop_v))
+#     
+#     ### Print Plot
+#     print(currDim_gg)
+#     
+#     ### Save Plot
+#     pdf(file = file.path(currOutDir_v, paste0(currPop_v, "_dimPlot.pdf")))
+#     print(currDim_gg)
+#     dev.off()
+#     
+#   } # for j
+#   
+# } # for i
+```
+
+# SingleR
+
+```{r load Ref, eval = F}
+refFiles_v <- list.files(refDir_v, pattern = "batch")
+ref_lsobj <- lapply(refFiles_v, function(x) readRDS(file.path(refDir_v, x)))
+names(ref_lsobj) <- gsub("batch12_|batch3_|\\.rds", "", refFiles_v)
+ref_lssce <- lapply(ref_lsobj, function(x) as.SingleCellExperiment(x, assay = "RNA"))
+
+```
+
+```{r, eval = T}
+for (i in 1:length(all_lslsobj)) {
+  
+  ### Get tissue name and object list
+  currTissue_v <- names(all_lslsobj)[i]
+  currTissue_lsobj <- all_lslsobj[[currTissue_v]]
+  
+  for (j in 1:length(currTissue_lsobj)) {
+    
+    ### Get major population object
+    currPop_v <- names(currTissue_lsobj)[j]
+    currPop_obj <- currTissue_lsobj[[currPop_v]]
+    
+    ### Get reference
+    if (currPop_v == "other") currRefName_v <- "neoplastic" else currRefName_v <- currPop_v
+    
+    ### Get query matrix
+    currQuery_mat <- GetAssayData(currPop_obj, layer = "data")
+    
+    ### Run prediction
+    tictoc::tic()
+    currPred <- SingleR(test = currQuery_mat, ref = ref_lssce[[currRefName_v]],
+                        labels = ref_lssce[[currRefName_v]]$sPop,
+                        BPPARAM=MulticoreParam(8))
+    tictoc::toc()
+    
+    ### Add to object
+    currPop_obj$SingleR <- currPred$pruned.labels
+    currTissue_lsobj[[currPop_v]] <- currPop_obj
+    
+  } # for j
+  
+  all_lslsobj[[currTissue_v]] <- currTissue_lsobj
+} # for i
+
+
+
+
+# Add pruned labels (low-confidence calls set to NA) to Seurat metadata
+pbmc$SingleR_label <- pred$pruned.labels
+```
+
+# Write out
+
+```{r}
+newRdsDir_v <- mkdir(rdsDir_v, "subProcessed")
+sapply(names(all_lslsobj), function(x) {
+  sapply(names(all_lslsobj[[x]]), function(y) {
+    saveRDS(all_lslsobj[[x]][[y]], file = file.path(newRdsDir_v, paste0("from", x, "_", y, ".rds")))
+  })
+})
+```
+
+
+```{r}
+sessionInfo()
+```
