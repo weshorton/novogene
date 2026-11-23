@@ -1,0 +1,315 @@
+---
+title: "Novogene Analysis"
+subtitle: "Subcluster"
+date: " Last updated on `r format(Sys.time(), '%B %d, %Y')`"
+author: "Wes Horton"
+output:
+  html_document:
+    toc: true
+    toc_float: 
+      collapsed: false
+      smooth_scroll: false
+    toc_depth: 3
+    number_sections: true
+---
+
+# Summary
+
+Load in the major population splits and re-process, re-cluster them.
+
+Tumor source:
+1.
+1.
+1.
+1.
+
+Blood Source:
+1. Lymphoid
+1. Myeloid
+
+
+```{r load_libraries, echo=FALSE, message = FALSE, warning = FALSE}
+library(Seurat)
+library(Matrix)
+library(wrh.rUtils)
+library(wrh.scRNA)
+library(SingleR)
+library(UCell)
+library(kableExtra)
+library(ggplot2)
+library(ggpubr)
+library(data.table)
+library(glmGamPoi)
+options(future.globals.maxSize= 891289600000)
+
+### Local run
+# baseDir_v <- "/Volumes/wrh_padlock3/projects/AP/novogene/"
+
+### Exa run
+baseDir_v <- "/home/exacloud/gscratch/CoussensLab/transcriptomic/novogene"
+dataDir_v <- file.path(baseDir_v, "aligned")
+rdsDir_v <- mkdir(baseDir_v, "rds")
+qcDir_v <- mkdir(baseDir_v, "QC")
+refDir_v <- file.path(baseDir_v, "ref")
+plotDir_v <- mkdir(baseDir_v, "plots/noSketch")
+
+### Get files
+allFiles_v <- list.files(rdsDir_v, pattern = "from")
+tumorFiles_v <- grep("Tumor", allFiles_v, value = T)
+bloodFiles_v <- grep("Blood", allFiles_v, value = T)
+
+# Run Flags
+minPC_v <- F
+pcName_v <- ifelse(minPC_v, "minPC", "maxPC")
+
+source("/home/exacloud/gscratch/CoussensLab/transcriptomic/novogene/scripts/uCellGeneLists.R")
+```
+
+# Load
+
+```{r}
+### only load this if already run the rest
+subDir_v <- file.path(rdsDir_v, "subProcessed")
+files_v <- list.files(subDir_v)
+
+all_lslsobj <- list("Tumor" = lapply(files_v, function(x) readRDS(file.path(subDir_v, x))))
+names(all_lslsobj$Tumor) <- gsub("fromTumor_|\\.rds", "", files_v)
+```
+
+# UCell Scores
+
+## Lymphoid
+
+```{r}
+all_lslsobj$Tumor$lymphoid <- AddModuleScore_UCell(all_lslsobj$Tumor$lymphoid,
+                                                   features = uCellLymphoidMarkers_lsv)
+
+# grab the score columns (UCell appends "_UCell" to each set name)
+score_cols <- paste0(names(uCellLymphoidMarkers_lsv), "_UCell")
+
+# per-cluster mean scores
+lymphoidScores_dt <- as.data.table(all_lslsobj$Tumor$lymphoid@meta.data)[, c("seurat_clusters", score_cols), with = FALSE]
+avgLymphoidScores_dt <- lymphoidScores_dt[, lapply(.SD, mean), by = seurat_clusters]
+setorder(avgLymphoidScores_dt, seurat_clusters)
+avgLymphoidScores_mat <- as.matrix(convertDFT(avgLymphoidScores_dt, col_v = "seurat_clusters"))
+
+colnames(avgLymphoidScores_mat) <- gsub("_UCell", "", colnames(avgLymphoidScores_mat))
+
+pheatmap::pheatmap(t(avgLymphoidScores_mat), scale = "column", clustering_method = "ward.D2",
+                   cluster_cols = F, cluster_rows = F, main = "Scale Column - Cluster's Top Population",
+                   angle_col = 0)
+pheatmap::pheatmap(t(avgLymphoidScores_mat), scale = "row", clustering_method = "ward.D2",
+                   cluster_cols = F, cluster_rows = F, main = "Scale row - Population's Top Cluster(s)",
+                   angle_col = 0)
+
+pdf(file = file.path(plotDir_v, "lymphohidUCellHeatmap.pdf"), height = 4, width = 5)
+pheatmap::pheatmap(t(avgLymphoidScores_mat), scale = "column", clustering_method = "ward.D2",
+                   cluster_cols = F, cluster_rows = F, main = "Scale Column - Cluster's Top Population",
+                   angle_col = 0)
+pheatmap::pheatmap(t(avgLymphoidScores_mat), scale = "row", clustering_method = "ward.D2",
+                   cluster_cols = F, cluster_rows = F, main = "Scale row - Population's Top Cluster(s)",
+                   angle_col = 0)
+dev.off()
+```
+
+```{r, fig.width=10, fig.height=30}
+lymphoidMelt_dt <- melt(lymphoidScores_dt, id.vars = "seurat_clusters")
+
+ggplot(lymphoidMelt_dt, aes(x = seurat_clusters, y = value)) + geom_violin() + 
+  facet_wrap(~variable, scales = "free", ncol= 5)
+
+ggplot(lymphoidMelt_dt, aes(x = variable, y = value)) + geom_violin() + 
+  facet_wrap(~seurat_clusters, scales = "free", ncol= 1)
+```
+
+Myeloid Lymphoid
+
+```{r}
+all_lslsobj$Tumor$myeloid <- AddModuleScore_UCell(all_lslsobj$Tumor$myeloid,
+                                                   features = uCellMyeloidMarkers_lsv)
+
+# grab the score columns (UCell appends "_UCell" to each set name)
+score_cols <- paste0(names(uCellMyeloidMarkers_lsv), "_UCell")
+
+# per-cluster mean scores
+myeloidScores_dt <- as.data.table(all_lslsobj$Tumor$myeloid@meta.data)[, c("seurat_clusters", score_cols), with = FALSE]
+avgMyeloidScores_dt <- myeloidScores_dt[, lapply(.SD, mean), by = seurat_clusters]
+setorder(avgMyeloidScores_dt, seurat_clusters)
+avgMyeloidScores_mat <- as.matrix(convertDFT(avgMyeloidScores_dt, col_v = "seurat_clusters"))
+
+colnames(avgMyeloidScores_mat) <- gsub("_UCell", "", colnames(avgMyeloidScores_mat))
+
+pheatmap::pheatmap(t(avgMyeloidScores_mat), scale = "column", clustering_method = "ward.D2",
+                   cluster_cols = F, cluster_rows = F, main = "Scale Column - Cluster's Top Population",
+                   angle_col = 0)
+pheatmap::pheatmap(t(avgMyeloidScores_mat), scale = "row", clustering_method = "ward.D2",
+                   cluster_cols = F, cluster_rows = F, main = "Scale row - Population's Top Cluster(s)",
+                   angle_col = 0)
+
+pdf(file = file.path(plotDir_v, "myeloidUCellHeatmap.pdf"), height = 4, width = 5)
+pheatmap::pheatmap(t(avgMyeloidScores_mat), scale = "column", clustering_method = "ward.D2",
+                   cluster_cols = F, cluster_rows = F, main = "Scale Column - Cluster's Top Population",
+                   angle_col = 0)
+pheatmap::pheatmap(t(avgMyeloidScores_mat), scale = "row", clustering_method = "ward.D2",
+                   cluster_cols = F, cluster_rows = F, main = "Scale row - Population's Top Cluster(s)",
+                   angle_col = 0)
+dev.off()
+```
+
+```{r, fig.width=10, fig.height=30}
+myeloidMelt_dt <- melt(myeloidScores_dt, id.vars = "seurat_clusters")
+ggplot(myeloidMelt_dt, aes(x = seurat_clusters, y = value)) + geom_violin() + facet_wrap(~variable, scales = "free", ncol= 5)
+ggplot(myeloidMelt_dt, aes(x = variable, y = value)) + geom_violin() + facet_wrap(~seurat_clusters, scales = "free", ncol= 1)
+```
+
+# Feature Plots
+
+## Lymphoid
+
+```{r}
+lymphoidFeatDir_v <- mkdir(plotDir_v, "tumorLymphoidFeatures")
+for (i in 1:length(uniqueLymphoidMarkers_lsv)) {
+  
+  currPopName_v <- names(uniqueLymphoidMarkers_lsv)[i]
+  currGenes_v <- uniqueLymphoidMarkers_lsv[[currPopName_v]]
+  currGenes_v <- intersect(currGenes_v, rownames(all_lslsobj$Tumor$lymphoid))
+  
+  if (length(currGenes_v) < 5) {
+    currH_v <- 12; currW_v <- 12
+  } else {
+    currH_v <- 12; currW_v <- 20
+  }
+  
+  currFeat_lsgg <- lapply(currGenes_v, function(x) {
+    y <- FeaturePlot(all_lslsobj$Tumor$lymphoid, features = x) + theme(plot.title = element_text(size = 16))
+    return(y)})
+  currFeat_gg <- ggpubr::ggarrange(plotlist = currFeat_lsgg)
+  currFeat_gg <- ggpubr::annotate_figure(currFeat_gg, top = text_grob(label = currPopName_v, size = 16))
+  
+  pdf(file = file.path(lymphoidFeatDir_v, paste0(currPopName_v, "_feat.pdf")), width = currW_v, height = currH_v)
+  print(currFeat_gg)
+  dev.off()
+}
+```
+
+## Myeloid
+
+```{r}
+myeloidFeatDir_v <- mkdir(plotDir_v, "tumorMyeloidFeatures")
+for (i in 1:length(uniqueMyeloidMarkers_lsv)) {
+  
+  currPopName_v <- names(uniqueMyeloidMarkers_lsv)[i]
+  currGenes_v <- uniqueMyeloidMarkers_lsv[[currPopName_v]]
+  currGenes_v <- intersect(currGenes_v, rownames(all_lslsobj$Tumor$myeloid))
+  
+  if (length(currGenes_v) == 1) {
+    currH_v <- 6; currW_v <- 6
+  } else if (length(currGenes_v) == 2) {
+    currH_v <- 6; currW_v <- 12
+  } else if (length(currGenes_v) %in% 3:4) {
+    currH_v <- 12; currW_v <- 12
+  } else if (length(currGenes_v) %in% 5:6) {
+    currH_v <- 12; currW_v <- 20
+  } else {
+    currH_v <- 18; currW_v <- 20
+  }
+  
+  currFeat_lsgg <- lapply(currGenes_v, function(x) {
+    y <- FeaturePlot(all_lslsobj$Tumor$myeloid, features = x) + theme(plot.title = element_text(size = 16))
+    return(y)})
+  currFeat_gg <- ggpubr::ggarrange(plotlist = currFeat_lsgg)
+  currFeat_gg <- ggpubr::annotate_figure(currFeat_gg, top = text_grob(label = currPopName_v, size = 16))
+  
+  pdf(file = file.path(myeloidFeatDir_v, paste0(currPopName_v, "_feat.pdf")), width = currW_v, height = currH_v)
+  print(currFeat_gg)
+  dev.off()
+}
+```
+
+# Custom Feature Plots
+
+```{r}
+customFeats_lslsv <- list("lymphoid" = list("Major" = c("Cd3d", "Cd3e", "Cd3g", "Trac", "Cd2", "Cd28",
+                                                         "Cd4", "Il7r", "Cd8a", "Cd8b1", "Ltb", "Cd40lg"),
+                                            "Subsets1" = c("Foxp3","Il2ra","Ctla4","Ikzf2","Tigit","Tnfrsf18",
+                                                           "Rorc","Il17a","Ccr6","Il23r","Klrb1", "Ccr5"),
+                                            "Subsets2" = c("Trdc", "Il18rap", "Zbtb16", "Ccr7", "Tcf7", "Sell", 
+                                                           "Lef1", "Cxcr5","Pdcd1","Icos","Bcl6","Cd200"),
+                                            "prolifCyto" = c("Gzmb","Gzmk","Prf1","Nkg7","Fgfbp2","Klrg1","Cx3cr1",
+                                                           "Mki67","Top2a","Stmn1","Tyms"),
+                                            "Subsets3" = c("Pdcd1","Lag3","Havcr2","Tigit","Tox","Layn",
+                                                           "Cxcl13", "Cd69","Itgae","Cxcr6","Znf683","Runx3"), 
+                                            "Subsets4" = c("Tbx21","Ifng","Cxcr3", "Il21"),
+                                            "Bcell" = c("Ms4a1","Cd79a","Cd79b","Cd19","Pax5","H2-Ab1",
+                                                        "Fcer2a","Bank1", "Cd27","Aim2","Cd80", "Irf4"),
+                                            "NK" = c("Nkg7", "Klrd1", "Xcl1", "Ncam1","Xcl2","Gzmk","Il7r",
+                                                     "Gnly","Klrf1","Prf1", "Fcgr3a","Fgfbp2")),
+                          "myeloid" = list("mono" = c("Cd14","S100a8","S100a9","Vcan","Fcn1","Lst1",
+                                                      "Fcgr3a","Ms4a7","Cdkn1c", "Cx3cr1","Ms4a7"),
+                                           "granulocyte" = c("Ly6g","Cxcr2","Csf3r","S100a8","S100a9","Mmp9",
+                                                             "Lcn2","Retnlg","Fpr2", "Siglecf","Prg2","Epx",
+                                                             "Kit","Cpa3","Tpsab1","Ms4a2"),
+                                           "dc" = c("Clec9a","Xcr1","Wdfy4","Cadm1","Irf8","Sirpa",
+                                                    "Itgam","Clec10a","Cd1b", "Siglech","Bst2","Irf7",
+                                                    "Tcf4","Clec4c", "Ccr7","Cd83","Fscn1","Cd274"),
+                                           "tam" = c("Cd68","Apoe","Apoc1","C1qa","C1qb","Lyz2",
+                                                     "Mertk", "Mrc1","Lyve1","Folr2","Msr1","Cd163",
+                                                     "Spp1","Mmp9","Vegfa", "Trem2","Lpl","Il1b",
+                                                     "Tnf","Ccl3","Ccl4","Cxcl10", "Isg15","Ifit1",
+                                                     "Ifit3","Mx1","Ifitm3"),
+                                           "mdsc" = c("Arg1","Anxa1","Lcn2","Olfm4", "Mki67","Top2a")))
+```
+
+```{r}
+for (i in 1:length(customFeats_lslsv)) {
+  
+  currPop_v <- names(customFeats_lslsv)[i]
+  currObj <- all_lslsobj$Tumor[[currPop_v]]
+  currList_lsv <- customFeats_lslsv[[currPop_v]]
+  
+  for (j in 1:length(currList_lsv)) {
+    
+    ### Get genes
+    currGroupName_v <- names(currList_lsv)[j]
+    currGenes_v <- intersect(currList_lsv[[currGroupName_v]], rownames(currObj))
+    
+    ### Determine plot size
+    if (length(currGenes_v) <= 4) {
+      currH_v <- 12; currW_v <- 12
+    } else if (length(currGenes_v) == 6) {
+      currH_v <- 18; currW_v <- 12
+    } else if (length(currGenes_v) %in% 11:12) {
+      currH_v <- 18; currW_v <- 24
+    } else if (length(currGenes_v) %in% 16:18) {
+      currH_v <- 24; currW_v <- 24
+    } else {
+      currH_v <- 42; currW_v <- 24
+    }
+    
+    ### Make plot
+    currFeat_gg <- FeaturePlot(currObj, features = currGenes_v)
+    
+    pdf(file = file.path(myeloidFeatDir_v, paste0(currPopName_v, "_feat.pdf")), width = currW_v, height = currH_v)
+    print(currFeat_gg)
+    dev.off()
+    
+  } # for j
+} # for i
+
+```
+
+# Write out
+
+```{r}
+newRdsDir_v <- mkdir(rdsDir_v, "subProcessed")
+sapply(names(all_lslsobj), function(x) {
+  sapply(names(all_lslsobj[[x]]), function(y) {
+    saveRDS(all_lslsobj[[x]][[y]], file = file.path(newRdsDir_v, paste0("from", x, "_", y, "_UCell.rds")))
+  })
+})
+```
+
+
+```{r}
+sessionInfo()
+```
